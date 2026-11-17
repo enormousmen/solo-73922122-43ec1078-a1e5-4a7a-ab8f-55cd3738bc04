@@ -14,7 +14,9 @@ Design notes
   can therefore never hit the *next* job on the same connection.
 * A connection is returned to the idle pool only after SQL execution has
   stopped, the cancel send (if any) has completed, and session cleanup has
-  finished.
+  finished.  Only then is the job record released, i.e. made eligible for
+  history eviction (see ``store.JobStore``); until that point the record
+  always stays queryable and the cancel sender can always find it.
 """
 from __future__ import annotations
 
@@ -236,17 +238,22 @@ class _Worker(threading.Thread):
     def _run_job(self, job: Job) -> None:
         cinfo = self.cinfo
         if job.is_terminal():
-            return  # cancelled while still queued; connection untouched
+            # Cancelled while still queued; connection untouched and the
+            # record is no longer needed by the background.
+            self.pool.store.mark_released(job)
+            return
         cinfo.set_state("busy", current_job_id=job.id)
         if not job.mark_running(cinfo.id):
             cinfo.set_state("idle")
+            self.pool.store.mark_released(job)
             return  # lost the race with a queued-cancel
         try:
             self._execute_statements(job)
         finally:
             # The connection is returned only after (1) SQL execution has
             # stopped, (2) any accepted cancel has been fully sent, and
-            # (3) session cleanup has completed.
+            # (3) session cleanup has completed.  Only then is the record
+            # released and may be evicted from the history.
             if job.cancel_requested.is_set():
                 if not job.cancel_send_done.wait(timeout=config.CANCEL_SEND_WAIT_S):
                     log.error("job %s: cancel send did not finish in time", job.id)
@@ -264,7 +271,7 @@ class _Worker(threading.Thread):
             with cinfo.lock:
                 cinfo.jobs_executed += 1
             cinfo.set_state("idle")
-            job.done.set()
+            self.pool.store.mark_released(job)
 
     def _execute_statements(self, job: Job) -> None:
         conn = self.cinfo.conn

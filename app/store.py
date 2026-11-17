@@ -1,9 +1,16 @@
 """In-memory job registry.
 
 Jobs live in memory only (diagnostic service; nothing to persist across
-restarts).  All mutable fields are guarded by a per-job lock; the two
-``threading.Event`` flags are written by the API/cancel threads and read by
-the worker threads.
+restarts).  All mutable fields are guarded by a per-job lock; the
+``threading.Event`` flags are written by the API/cancel threads and read
+by the worker threads.
+
+Retention policy (see :class:`JobStore`): a record whose background
+processing is not finished yet -- queued, running, or already decided
+but with the cancel send / session cleanup still pending -- is NEVER
+evicted, so it stays queryable and cancellable.  Only records the
+background has fully released are subject to the configured history
+capacity.
 """
 from __future__ import annotations
 
@@ -36,8 +43,12 @@ class Job:
         self.cancel_requested = threading.Event()
         self.cancel_send_done = threading.Event()
         self.cancel_accepted_at: str | None = None
-        # set when the job reaches a terminal state
-        self.done = threading.Event()
+        # Set once the background is completely done with this record:
+        # SQL stopped AND any accepted cancel send finished AND session
+        # cleanup completed AND the connection returned -- or the job
+        # never ran at all (cancelled while queued).  Only released
+        # records are eligible for history eviction.
+        self.released = threading.Event()
         self.records = [
             {
                 "index": i,
@@ -108,7 +119,23 @@ class Job:
             self.status = status
             self.finished_at = utcnow()
             self.error = error
-            self.done.set()
+            return True
+
+    def finish_if_queued(self, status: str, error: str | None = None) -> bool:
+        """Atomically move a *queued* job to a terminal state.
+
+        Returns False if the job has already left the queued state
+        (running or terminal); the caller must then take the
+        running/terminal path.  Because this is atomic with
+        :meth:`mark_running` (both take the job lock), a True result
+        guarantees no worker will ever start the job.
+        """
+        with self.lock:
+            if self.status != "queued":
+                return False
+            self.status = status
+            self.finished_at = utcnow()
+            self.error = error
             return True
 
     # ---- reads -------------------------------------------------------------
@@ -147,7 +174,19 @@ class Job:
 
 
 class JobStore:
-    """Thread-safe registry keeping the most recent ``capacity`` jobs."""
+    """Thread-safe registry of job records.
+
+    Retention policy
+    ----------------
+    * Active records -- queued, running, or decided but not yet released
+      (cancel send / session cleanup still pending) -- are NEVER evicted:
+      they stay queryable and cancellable no matter how many newer jobs
+      arrive, and they do not count against the history capacity.
+    * Released records (the background is completely done with them) are
+      evicted oldest-first once more than ``capacity`` of them are
+      retained: the configured history capacity is still enforced for
+      completed jobs.
+    """
 
     def __init__(self, capacity: int):
         self._lock = threading.Lock()
@@ -157,8 +196,25 @@ class JobStore:
     def add(self, job: Job) -> None:
         with self._lock:
             self._jobs[job.id] = job
-            while len(self._jobs) > self._capacity:
-                self._jobs.popitem(last=False)
+            self._evict_locked()
+
+    def mark_released(self, job: Job) -> None:
+        """Mark ``job`` as no longer used by the background and evict
+        surplus finished records.  Idempotent."""
+        job.released.set()
+        with self._lock:
+            self._evict_locked()
+
+    def _evict_locked(self) -> None:
+        finished = [
+            job_id for job_id, job in self._jobs.items() if job.released.is_set()
+        ]
+        surplus = len(finished) - self._capacity
+        if surplus <= 0:
+            return
+        # OrderedDict iterates in insertion order: oldest finished first.
+        for job_id in finished[:surplus]:
+            del self._jobs[job_id]
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:

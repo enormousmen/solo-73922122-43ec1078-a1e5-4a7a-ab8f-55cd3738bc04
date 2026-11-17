@@ -406,6 +406,93 @@ class TestNonBlocking:
             wait_pool_idle(client)
 
 
+class TestJobHistory:
+    """History retention under capacity pressure.
+
+    docker-compose sets JOB_HISTORY=2, so a handful of finished records
+    already overflows the configured capacity.  Unfinished jobs (queued,
+    running, or with cancel send / cleanup still pending) must stay
+    queryable and cancellable regardless; only released records are
+    evicted.  The tests also pass against a large JOB_HISTORY (the
+    pressure then stays below the capacity and the assertions hold
+    trivially).
+    """
+
+    def test_queued_job_survives_history_pressure(self, client):
+        """JOB_HISTORY=2, jobs submitted back to back: the still-queued
+        job must not vanish (the reported 404 bug) and stays cancellable."""
+        s1, _ = occupy_one_conn(client, seconds=15)
+        s2, _ = occupy_one_conn(client, seconds=15)
+        try:
+            # fillers queue up in front of the target; once s1 is
+            # cancelled they finish one by one, piling up more finished
+            # records than JOB_HISTORY while the target is still queued
+            fillers = [submit(client, ["SELECT pg_sleep(0.4)"]) for _ in range(4)]
+            target = submit(
+                client, ["CREATE TABLE public.should_not_exist_hist (id int)"]
+            )
+            cancel(client, s1)  # free one connection so fillers complete
+            deadline = time.monotonic() + 10
+            seen_queued = False
+            while time.monotonic() < deadline:
+                r = client.get(f"/jobs/{target}")
+                assert r.status_code == 200, (
+                    "queued job evicted by history pressure: "
+                    f"HTTP {r.status_code}"
+                )
+                if r.json()["status"] == "queued":
+                    seen_queued = True
+                    break
+                time.sleep(0.05)
+            assert seen_queued, "target never observed in queued state"
+            # still cancellable while unfinished
+            r = cancel(client, target)
+            assert r.status_code == 202, r.text
+            job = get_job(client, target)
+            assert job["status"] == "cancelled"
+            assert job["statements"][0]["status"] in ("pending", "skipped")
+        finally:
+            cancel(client, s1)
+            cancel(client, s2)
+            wait_pool_idle(client)
+        # the cancelled queued job must never have executed
+        check = wait_job(
+            client,
+            submit(client, ["SELECT to_regclass('public.should_not_exist_hist') AS t"]),
+        )
+        assert check["statements"][0]["rows"] == [[None]]
+
+    def test_cancel_send_pending_record_not_evicted(self, client):
+        """A cancelled job whose cancel send is still pending (delayed-send
+        hook) must not be evicted: the record stays queryable and the
+        cancel is still delivered (no lost send, no 180s empty wait)."""
+        target = submit(client, ["SELECT pg_sleep(8)", "SELECT 2"])
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                j = get_job(client, target)
+                if j["status"] == "running":
+                    break
+                assert time.monotonic() < deadline, j
+                time.sleep(0.1)
+            r = cancel(client, target, delay_ms=2500)
+            assert r.status_code == 202
+            # while the cancel send is pending, overflow the finished
+            # history (JOB_HISTORY=2) on the other connection
+            for _ in range(4):
+                wait_job(client, submit(client, ["SELECT 1"]))
+            # the record must still be there (pre-fix: evicted -> 404 and
+            # the pending cancel send was lost)
+            j = get_job(client, target)
+            assert j["cancel_requested"] is True
+            job = wait_job(client, target, timeout=30)
+            assert job["status"] == "cancelled"
+            assert job["statements"][1]["status"] == "skipped"
+        finally:
+            cancel(client, target)
+            wait_pool_idle(client)
+
+
 class TestConnectionRebuild:
     def test_cleanup_failure_retires_and_rebuilds_connection(self, client):
         """break_connection_after hook: cleanup fails -> retire -> rebuild."""

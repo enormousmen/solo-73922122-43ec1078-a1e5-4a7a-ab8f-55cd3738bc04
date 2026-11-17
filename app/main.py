@@ -147,14 +147,27 @@ def cancel_job(job_id: str, req: CancelRequest | None = None):
 
     if status == "queued":
         # Never started: nothing runs on the server, nothing to clean.
-        job.finish("cancelled", "cancelled while queued")
-        job.cancel_send_done.set()
-        return CancelResponse(
-            job_id=job.id,
-            accepted=True,
-            job_status="cancelled",
-            detail="job was queued; cancelled before any statement ran",
-        )
+        # Finish atomically so no worker can start the job in between
+        # (mark_running refuses terminal jobs); only then is the record
+        # released for history eviction.
+        if job.finish_if_queued("cancelled", "cancelled while queued"):
+            job.cancel_send_done.set()
+            store.mark_released(job)
+            return CancelResponse(
+                job_id=job.id,
+                accepted=True,
+                job_status="cancelled",
+                detail="job was queued; cancelled before any statement ran",
+            )
+        # Lost the race: the job started (or even finished) while the
+        # cancel was being accepted.  Re-read and take the matching path.
+        with job.lock:
+            if job.status in TERMINAL_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"job already {job.status}; cancel ignored",
+                )
+            status = job.status
 
     # Running: stop after the current statement.  The cancel send itself is
     # handed to the sender thread (with the optional test-hook delay) so the

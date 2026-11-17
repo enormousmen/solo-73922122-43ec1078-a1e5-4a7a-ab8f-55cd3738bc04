@@ -27,6 +27,10 @@ PostgreSQL 连接**之一上按序自动提交执行；支持逐句结果查询�
 - **排队**：两条连接都忙时，新单在内存队列等待（默认上限 1000，超出返回 429）。
 - **互不阻塞**：每条连接一个独立 worker；慢 SQL、慢清理只占用本连接的 worker，
   另一连接的执行、提交以及所有状态查询（读内存注册表）都不受影响。
+- **记录保留**：未结束的单（排队中、执行中，或已有结论但取消发送/会话清理
+  未完结）**永不因历史容量被淘汰**，始终可查、可取消；只有后台完全处理完毕
+  （SQL 停止 + 取消发送完成 + 清理完成 + 连接归还，或从未运行）的记录才按
+  `JOB_HISTORY` 容量淘汰最旧的。
 
 ## 快速开始
 
@@ -34,6 +38,10 @@ PostgreSQL 连接**之一上按序自动提交执行；支持逐句结果查询�
 docker compose up --build
 # API: http://localhost:8000  文档: http://localhost:8000/docs
 ```
+
+compose 中特意把 `JOB_HISTORY` 设为 **2**，方便在 /docs 里直接演示容量压力：
+连续提交多个单（可先用 `SELECT pg_sleep(30)` 占住两条连接），未结束的单始终
+可查、可取消；已完成的记录只保留最新 2 条。正常使用可调大（默认 1000）。
 
 本地开发（需自有 PostgreSQL）：
 
@@ -43,7 +51,8 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
   uvicorn app.main:app --port 8000
 ```
 
-演示脚本（覆盖：顺序执行、会话清理验证、取消、慢取消发送/慢清理钩子、迟到取消）：
+演示脚本（覆盖：顺序执行、会话清理验证、取消、慢取消发送/慢清理钩子、迟到取消、
+历史容量压力下未结束单不消失）：
 
 ```bash
 ./scripts/demo.sh            # BASE=http://localhost:8000 可覆盖
@@ -88,7 +97,19 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 - **迟到取消**：单已结束时取消返回 409（无操作）；发送线程在发送前按连接校验
   "该单仍是此连接当前单且未结束"，因此**迟到的取消绝不会误停同一连接上的下一单**。
 - **连接归还条件**：SQL 停止 + 取消发送完成 + 会话清理完成，三者齐备后连接才
-  回到空闲（可用延迟钩子直接观测）。
+  回到空闲（可用延迟钩子直接观测）；此时任务记录才被"释放"，此前它不会被
+  历史容量淘汰，取消发送线程也一定能找到它（不会漏发、不会空等超时）。
+
+### 记录保留与历史容量
+
+- **未结束的单永不被淘汰**：排队中、执行中，以及 SQL 已有结论但取消发送或
+  会话清理尚未完结的单，始终可通过 `GET /jobs/{id}` 查询、可取消，与
+  `JOB_HISTORY` 无关，也不占用历史容量名额。
+- **已完成的单按容量淘汰**：后台不再使用的完成记录最多保留 `JOB_HISTORY`
+  条（默认 1000；compose 演示环境设为 2），超出时最旧的先被淘汰。
+- **取消发送不漏发**：已受理取消的单在取消发送完成前不会被释放，因此发送
+  线程按 `job_id` 查找时记录一定存在——不会漏发，worker 也不会空等
+  `CANCEL_SEND_WAIT_S` 超时。
 
 ### 会话清理（每单结束后，成功/失败/取消都执行）
 
@@ -110,7 +131,7 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/test_sqlguard.py        # 纯单元测试（SQL 守卫），无需数据库
+pytest tests/test_sqlguard.py tests/test_store.py   # 纯单元测试，无需数据库
 # 集成测试需要运行中的服务与数据库：
 API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
   pytest tests/test_integration.py
@@ -119,7 +140,8 @@ API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@
 集成测试覆盖：按序自动提交与逐句结果、行数截断、失败即停、参数校验、
 会话状态不泄漏（SET/临时表/咨询锁/预备语句，含失败单）、取消运行中/排队中的单、
 迟到取消（409 与延迟发送不误伤下一单）、慢 SQL/慢清理不阻塞另一连接、
-清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）。
+清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）、
+历史容量压力下未结束单不消失（排队单可查可取消、取消发送待发的单不被清退）。
 
 > 注：PostgreSQL 的语句取消依赖向后端进程投递 SIGINT。在禁止进程间信号的
 > 沙箱里，"中断正在执行的语句"无法生效（`pg_terminate_backend` 同样无效），
@@ -130,7 +152,8 @@ API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@
 
 - 面向**可信 SQL**（值班 DBA）：守卫只强制执行契约（单句、禁显式事务），
   不是安全边界；`CALL`/`DO` 体内的事务控制无法静态识别，属约定范围。
-- 任务注册表在内存中（重启即失），保留最近 1000 单。
+- 任务注册表在内存中（重启即失）。保留策略：未结束（未释放）的单永不淘汰；
+  已完成的单最多保留 `JOB_HISTORY` 条（默认 1000），超出淘汰最旧的。
 - 结果行数上限 `ROW_LIMIT`（默认 200，超出截断并标记 `truncated`）。
 - 单进程单实例：连接池在进程内，勿以多 worker 方式启动 uvicorn。
 - 连接使用 `prepare_threshold=None`，避免 psycopg 的客户端预备语句缓存与

@@ -76,3 +76,28 @@ curl -s -o /dev/null -w "cancel after finish -> HTTP %{http_code}\n" \
 echo
 echo "=== 6) explicit transaction control is rejected (422) ==="
 curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["BEGIN", "SELECT 1"]}' | pp
+
+echo
+echo "=== 7) history-capacity pressure: unfinished jobs are never evicted ==="
+echo "-- (docker-compose sets JOB_HISTORY=2; with the old bug the queued job"
+echo "--  below would already return 404 once newer jobs were submitted)"
+J1=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT pg_sleep(6)"]}' | jid)
+J2=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT pg_sleep(6)"]}' | jid)
+echo "-- both connections busy with 6s sleepers; submitting 3 more jobs:"
+Q1=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT 11"]}' | jid)
+Q2=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT 22"]}' | jid)
+TARGET=$(curl -s -XPOST "$BASE/jobs" -H "$JSON" -d '{"statements": ["SELECT 33"]}' | jid)
+echo "-- 5 jobs known, JOB_HISTORY=2; the still-queued target ($TARGET) must resolve:"
+curl -s "$BASE/jobs/$TARGET" | pp
+echo "-- and must still be cancellable:"
+curl -s -XPOST "$BASE/jobs/$TARGET/cancel" -H "$JSON" -d '{}' | pp
+echo "-- cancelled while queued; its record is still there:"
+curl -s "$BASE/jobs/$TARGET" | pp
+echo "-- job list: active records are all kept; finished history is capped:"
+curl -s "$BASE/jobs" | pp
+echo "-- cleaning up the sleepers (queued jobs Q1=$Q1 Q2=$Q2 then run):"
+curl -s -o /dev/null -w "cancel sleeper 1 -> HTTP %{http_code}\n" -XPOST "$BASE/jobs/$J1/cancel" -H "$JSON" -d '{}'
+curl -s -o /dev/null -w "cancel sleeper 2 -> HTTP %{http_code}\n" -XPOST "$BASE/jobs/$J2/cancel" -H "$JSON" -d '{}'
+sleep 2
+echo "-- afterwards only the newest JOB_HISTORY finished records are retained:"
+curl -s "$BASE/jobs" | pp

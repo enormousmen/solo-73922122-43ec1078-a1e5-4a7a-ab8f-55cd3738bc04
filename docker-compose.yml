@@ -19,6 +19,12 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/diag
+      # Deliberately small history so /docs can demonstrate the retention
+      # policy under capacity pressure: unfinished jobs (queued / running /
+      # cancel-send or cleanup still pending) are never evicted, while
+      # finished records are still evicted oldest-first beyond this many
+      # entries. Raise it (e.g. "1000") for normal use.
+      JOB_HISTORY: "2"
       # ROW_LIMIT: "200"
       # global defaults for the test hooks (per-request overrides exist):
       # CANCEL_SEND_DELAY_MS: "0"
